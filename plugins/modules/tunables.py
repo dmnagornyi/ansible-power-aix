@@ -5,6 +5,7 @@
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 from __future__ import absolute_import, division, print_function
+from ansible.module_utils.basic import AnsibleModule
 
 DOCUMENTATION = r'''
 ---
@@ -17,7 +18,7 @@ description:
 version_added: '1.5.0'
 requirements:
 - AIX >= 7.1 TL3
-- Python >= 2.7
+- Python >= 3.6
 - Root user is required.
 options:
   action:
@@ -94,7 +95,7 @@ EXAMPLES = r'''
   ibm.power_aix.tunables:
     action: modify
     component: vmo
-    bosboot_tunables: True
+    bosboot_tunables: true
     tunable_params_with_value:
       ame_mpsize_support: 1
 
@@ -107,7 +108,7 @@ EXAMPLES = r'''
   ibm.power_aix.tunables:
     action: show
     component: vmo
-    restricted_tunables: True
+    restricted_tunables: true
 
 - name: "Display information of given tunable parameters"
   ibm.power_aix.tunables:
@@ -129,7 +130,7 @@ EXAMPLES = r'''
   ibm.power_aix.tunables:
     action: modify
     component: vmo
-    restricted_tunables: True # in case of restricted tunables otherwise default is false
+    restricted_tunables: true # in case of restricted tunables otherwise default is false
     tunable_params_with_value:
       lgpg_regions: 10   # dynamic tunable
       lgpg_size: 16777216 # dynamic tunables
@@ -141,7 +142,7 @@ EXAMPLES = r'''
   ibm.power_aix.tunables:
     action: modify
     component: vmo
-    bosboot_tunables: True # mandatory
+    bosboot_tunables: true # mandatory
     restricted_tunables: true # if restricted tunable to be changed
     tunable_params_with_value:
       kernel_heap_psize: 16777216 # bosboot tunable
@@ -158,8 +159,8 @@ EXAMPLES = r'''
   ibm.power_aix.tunables:
     action: modify
     component: vmo
-    restricted_tunables: True # because of restricted tunables otherwise default is false
-    bosboot_tunables: True # because of bosboot tunables otherwise default is false
+    restricted_tunables: true # because of restricted tunables otherwise default is false
+    bosboot_tunables: true # because of bosboot tunables otherwise default is false
     # if restricted tunable to be changed also then restricted_tunable: True
     tunable_params_with_value:
       lgpg_regions: 10   # dynamic tunable
@@ -177,8 +178,8 @@ EXAMPLES = r'''
   ibm.power_aix.tunables:
     action: reset
     component: vmo
-    restricted_tunables: True # because of restricted tunables otherwise default is false
-    bosboot_tunables: True # because of bosboot tunables otherwise default is false
+    restricted_tunables: true # because of restricted tunables otherwise default is false
+    bosboot_tunables: true # because of bosboot tunables otherwise default is false
     tunable_params: ['kernel_heap_psize', 'batch_tlb']
 
   register: result
@@ -192,15 +193,14 @@ EXAMPLES = r'''
   ibm.power_aix.tunables:
     action: modify
     component: vmo
-    restricted_tunables: True # because of restricted tunables otherwise default is false
-    bosboot_tunables: True # # because of bosboot tunables otherwise default is false
+    restricted_tunables: true # because of restricted tunables otherwise default is false
+    bosboot_tunables: true # # because of bosboot tunables otherwise default is false
     tunable_params: ['kernel_heap_psize', 'lgpg_regions', 'kernel_heap_psize', 'enhanced_affinity_balance']
 
   register: result
   # check for:
   # result.bosboot_required == True
   # result.reboot_required == True
-
 '''
 
 RETURN = r'''
@@ -250,8 +250,6 @@ ANSIBLE_METADATA = {'metadata_version': '1.1',
                     'status': ['preview'],
                     'supported_by': 'community'}
 
-from ansible.module_utils.basic import AnsibleModule
-
 results = {}
 tunables_dict = {}
 
@@ -284,8 +282,6 @@ def create_tunables_dict(module):
     else:
         # Convert the comma separated output into python dictionary for displaying full details
         tunables_dict = convert_to_dict(std_out)
-
-    return
 
 
 def get_valid_tunables(module):
@@ -330,7 +326,7 @@ def get_valid_tunables(module):
 
     if unchanged_tunables:
         results["unchanged_tunables"] = "New value of some tunables are same as existing value\n"
-        results["unchanged_tunables"] += "So these tunables are not modified: %s" % unchanged_tunables
+        results["unchanged_tunables"] += f"These tunables are not modified: { unchanged_tunables }"
 
     return valid_tunables
 
@@ -392,7 +388,7 @@ def convert_to_dict(tunable_info):
             tunable_value['type'] = 'Reboot: can only be changed during reboot'
         # Connect
         elif tunable_value['type'] == 'C':
-            tunable_value['type'] = 'Connect: changes are only effective for future socket connections'
+            tunable_value['type'] = 'Connect: changes only effective for future socket connections'
         # Mount
         elif tunable_value['type'] == 'M':
             tunable_value['type'] = 'Mount: changes are only effective for future mountings'
@@ -446,14 +442,12 @@ def show(module):
 
     if rc != 0:
         # In case command returns non zero return code, fail case
-        results['msg'] = "Failed to display values for tunables: %s" % tunables_to_show
+        results['msg'] = f"Failed to display values for tunables: { tunables_to_show }"
         module.fail_json(**results)
     else:
         # Convert the comma separated output into python dictionary for displaying full details
         results['msg'] = "Task has been SUCCESSFULLY executed."
         results['tunables_details'] = convert_to_dict(std_out)
-
-    return
 
 
 def reset(module):
@@ -500,8 +494,9 @@ def reset(module):
     if bosboot_tunables or change_type == 'reboot':
         cmd += '-r '
 
-    # -p when used in combination with -o, -d or -D, makes changes apply to both current and reboot values, that is,
-    # turns on the updating of the /etc/tunables/nextboot file in addition to the updating of the current value.
+    # -p when used in combination with -o, -d or -D, makes changes apply to both current and
+    # reboot values, that is, turns on the updating of the /etc/tunables/nextboot file in addition
+    # to the updating of the current value.
     if change_type == 'both':
         cmd += '-p '
 
@@ -524,18 +519,16 @@ def reset(module):
 
     if rc != 0:
         # In case command returns non zero return code, fail case
-        results['msg'] = "\nFailed to reset tunable parameter for component: %s" % component
+        results['msg'] = f"\nFailed to reset tunable parameter for component: { component }"
         module.fail_json(**results)
     else:
         if tunable_params is not None:
-            results['msg'] = 'Following tunables have been reset SUCCESSFULLY: %s \n' % changed_tunables
+            results['msg'] = f'Tunables have been reset SUCCESSFULLY: { changed_tunables } \n'
         else:
             if bosboot_tunables:
-                results['msg'] = 'All tunables including bosboot type have been reset SUCCESSFULLY for nextboot.\n'
-                results['msg'] += 'System needs bosboot and reboot for the changes to take effect.'
+                results['msg'] = 'Tunables have been reset SUCCESSFULLY for nextboot.\n'
+                results['msg'] += 'Perform bosboot and reboot for the changes to take effect.'
         results['msg'] += std_out
-
-    return
 
 
 def modify(module):
@@ -600,8 +593,9 @@ def modify(module):
     if bosboot_tunables:
         cmd += '-r '
 
-    # -p when used in combination with -o, -d or -D, makes changes apply to both current and reboot values, that is,
-    # turns on the updating of the /etc/tunables/nextboot file in addition to the updating of the current value.
+    # -p when used in combination with -o, -d or -D, makes changes apply to both
+    # current and reboot values, that is, turns on the updating of the /etc/tunables/nextboot
+    # file in addition to the updating of the current value.
     if change_type == 'both':
         cmd += '-p '
 
@@ -625,17 +619,15 @@ def modify(module):
 
     if rc != 0:
         # In case command returns non zero return code, fail case
-        results['msg'] = "Failed to set new values to tunable parameters for component: %s" % component
+        results['msg'] = f"Failed to set new values to tunables for component: { component }"
         module.fail_json(**results)
     else:
-        results['msg'] = "\nFollowing tunables have been changed SUCCESSFULLY: %s \n" % changed_tunables
+        results['msg'] = f"\nTunables have been changed SUCCESSFULLY: { changed_tunables } \n"
         results['msg'] += std_out
         if bosboot_tunables:
             results['msg'] += "\n To make the changes take effect, bosboot and reboot is required"
             results['bosboot_required'] = True
             results['reboot_required'] = True
-
-    return
 
 
 def main():
@@ -646,7 +638,8 @@ def main():
     module = AnsibleModule(
         argument_spec=dict(
             action=dict(type='str', required=True, choices=['show', 'modify', 'reset']),
-            component=dict(type='str', required=True, choices=['vmo', 'ioo', 'schedo', 'no', 'raso', 'nfso', 'asoo']),
+            component=dict(type='str', required=True, choices=['vmo', 'ioo', 'schedo', 'no',
+                                                               'raso', 'nfso', 'asoo']),
             change_type=dict(type='str', default='current', choices=['current', 'reboot', 'both']),
             bosboot_tunables=dict(type='bool', default=False),
             tunable_params=dict(type='list', elements='str'),
@@ -673,7 +666,7 @@ def main():
         if change_type == 'current' and bosboot_tunables:
             results['msg'] = 'Not possible to change current value of bosboot tunables\n'
             results['msg'] += 'Please provide change_type as reboot.'
-            results['msg'] += 'If you are providing change_type as current, then, only provide dynamic tunables.'
+            results['msg'] += 'For change_type = current, only dynamic tunables are supported.'
             module.fail_json(**results)
         modify(module)
     elif action == 'reset':

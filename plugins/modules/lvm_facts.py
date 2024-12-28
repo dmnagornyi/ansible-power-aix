@@ -5,6 +5,9 @@
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 from __future__ import absolute_import, division, print_function
+import re
+from ansible.module_utils.basic import AnsibleModule
+
 __metaclass__ = type
 
 ANSIBLE_METADATA = {'metadata_version': '1.1',
@@ -24,7 +27,7 @@ description:
 version_added: '1.1.0'
 requirements:
 - AIX >= 7.1 TL3
-- Python >= 2.7
+- Python >= 3.6
 options:
   name:
     description:
@@ -255,9 +258,6 @@ ansible_facts:
               sample: "/home"
 '''
 
-from ansible.module_utils.basic import AnsibleModule
-import re
-
 result = None
 
 
@@ -277,23 +277,37 @@ def load_pvs(module, name, LVM):
     rc, stdout, stderr = module.run_command(cmd)
     if rc != 0:
         warnings.append(
-            "Command failed. cmd={cmd} rc={rc} stdout={stdout} "
-            "stderr={stderr}"
-            .format(cmd=cmd, rc=rc, stdout=stdout, stderr=stderr))
+            f"Command failed. cmd={cmd} rc={rc} stdout={stdout} stderr={stderr}")
     else:
         for ln in stdout.splitlines():
             fields = ln.split()
             pv = fields[0]
             if (name != 'all' and name != pv):
                 continue
-            cmd = "lspv -L %s" % pv
+            LVM['PVs'][pv] = {
+                "PHYSICAL VOLUME": fields[0],
+                "PV IDENTIFIER": fields[1]
+            }
+            if len(fields) > 2:
+                LVM['PVs'][pv]["VOLUME GROUP"] = fields[2]
+                LVM['PVs'][pv]["vg"] = fields[2]
+            if len(fields) > 3:
+                LVM['PVs'][pv]["VG_STATE"] = fields[3]
+                LVM['PVs'][pv]["vg_state"] = fields[3]
+
+            cmd = f"lspv -L { pv }"
             rc, stdout, stderr = module.run_command(cmd)
             if rc != 0:
-                warnings.append(
-                    "Command failed. cmd={cmd} rc={rc} stdout={stdout} "
-                    "stderr={stderr}"
-                    .format(cmd=cmd, rc=rc, stdout=stdout, stderr=stderr)
-                )
+                warnings.append(f"Command failed. cmd={cmd} rc={rc} stdout={stdout} stderr={stderr}")
+                if stderr.find('0516-320') > -1:
+                    if fields[2] == "None":
+                        del LVM['PVs'][pv]["VOLUME GROUP"]
+                        del LVM['PVs'][pv]["vg"]
+                elif stderr.find('0516-010') > -1:
+                    try:
+                        LVM['PVs'][pv] = parse_pvs(module, stdout, pv)
+                    except (IndexError, AssertionError) as err:
+                        warnings.append(str(err))
             else:
                 try:
                     LVM['PVs'][pv] = parse_pvs(module, stdout, pv)
@@ -317,9 +331,7 @@ def parse_pvs(module, lspv_output, pv_name):
         first_line = lspv_output.splitlines()[0]
     except IndexError as no_first_line:
         raise IndexError from no_first_line(
-            "Unable to get first line of 'lspv {pv_name}' output. "
-            "lspv_output={lspv_output}"
-            .format(pv_name=pv_name, lspv_output=lspv_output)
+            f"Unable to get first line of 'lspv {pv_name}' output. lspv_output={lspv_output}"
         )
     match = re.search('VOLUME GROUP', first_line)
     if match is None:
@@ -350,12 +362,19 @@ def parse_pvs(module, lspv_output, pv_name):
     pv_data['vg'] = pv_data['VOLUME GROUP']
     pv_data['pv_state'] = pv_data['PV STATE']
     pv_data['pp_size'] = pv_data['PP SIZE']
-    pv_data['total_pps'] = pv_data['TOTAL PPs'].split()[0]
-    pv_data['free_pps'] = pv_data['FREE PPs'].split()[0]
-    pp_size_int = int(pv_data['pp_size'].split()[0])
-    pv_data['size_g'] = int(pv_data['total_pps']) * pp_size_int / 1024
-    pv_data['free_g'] = int(pv_data['free_pps']) * pp_size_int / 1024
-
+    for key in pv_data.copy():
+        if pv_data[key] == "???????":
+            del pv_data[key]
+    if pv_data.get('TOTAL PPs') is not None:
+        pv_data['total_pps'] = pv_data['TOTAL PPs'].split()[0]
+    if pv_data.get('free_pps') is not None:
+        pv_data['free_pps'] = pv_data['FREE PPs'].split()[0]
+    if pv_data.get('pp_size') is not None:
+        pp_size_int = int(pv_data['pp_size'].split()[0])
+        if pv_data.get('total_pps') is not None:
+            pv_data['size_g'] = int(pv_data['total_pps']) * pp_size_int / 1024
+        if pv_data.get('free_pps') is not None:
+            pv_data['free_g'] = int(pv_data['free_pps']) * pp_size_int / 1024
     return pv_data
 
 
@@ -374,24 +393,16 @@ def load_vgs(module, name, LVM):
     cmd = "lsvg"
     rc, stdout, stderr = module.run_command(cmd)
     if rc != 0:
-        warnings.append(
-            "Command failed. cmd={cmd} rc={rc} stdout={stdout} "
-            "stderr={stderr}"
-            .format(cmd=cmd, rc=rc, stdout=stdout, stderr=stderr)
-        )
+        warnings.append(f"Command failed. cmd={cmd} rc={rc} stdout={stdout} stderr={stderr}")
     else:
         for ln in stdout.splitlines():
             vg = ln.split()[0].strip()
             if (name != 'all' and name != vg):
                 continue
-            cmd = "lsvg %s" % vg
+            cmd = f"lsvg { vg }"
             rc, stdout, stderr = module.run_command(cmd)
             if rc != 0:
-                warnings.append(
-                    "Command failed. cmd={cmd} rc={rc} stdout={stdout} "
-                    "stderr={stderr}"
-                    .format(cmd=cmd, rc=rc, stdout=stdout, stderr=stderr)
-                )
+                warnings.append(f"Command failed. cmd={cmd} rc={rc} stdout={stdout} stderr={stderr}")
                 # make sure that varied off volume groups
                 # are returned.
                 # 0516-010: Volume group must be varied on; use varyonvg command.
@@ -425,9 +436,7 @@ def parse_vgs(module, lsvg_output, vg_name):
         first_line = lsvg_output.splitlines()[0]
     except IndexError as no_first_line:
         raise IndexError from no_first_line(
-            "Unable to get first line of 'lsvg {vg_name}' output. "
-            "lsvg_output={lsvg_output}"
-            .format(vg_name=vg_name, lsvg_output=lsvg_output)
+            f"Unable to get first line of 'lsvg {vg_name}' output. lsvg_output={lsvg_output}"
         )
     match = re.search('VG IDENTIFIER', first_line)
     if match is None:
@@ -473,22 +482,14 @@ def load_lvs(module, name, LVM):
     cmd = "lsvg"
     rc, stdout, stderr = module.run_command(cmd)
     if rc != 0:
-        warnings.append(
-            "Command failed. cmd={cmd} rc={rc} stdout={stdout} "
-            "stderr={stderr}"
-            .format(cmd=cmd, rc=rc, stdout=stdout, stderr=stderr)
-        )
+        warnings.append(f"Command failed. cmd={cmd} rc={rc} stdout={stdout} stderr={stderr}")
     else:
         for line in stdout.splitlines():
             vg = line.split()[0].strip()
-            cmd = "lsvg -l %s" % vg
+            cmd = f"lsvg -l { vg }"
             rc, stdout, stderr = module.run_command(cmd)
             if rc != 0:
-                warnings.append(
-                    "Command failed. cmd={cmd} rc={rc} stdout={stdout} "
-                    "stderr={stderr}"
-                    .format(cmd=cmd, rc=rc, stdout=stdout, stderr=stderr)
-                )
+                warnings.append(f"Command failed. cmd={cmd} rc={rc} stdout={stdout} stderr={stderr}")
             else:
                 try:
                     lv_data = parse_lvs(module, stdout, vg, name)
@@ -516,9 +517,8 @@ def parse_lvs(module, lsvg_output, vg_name, lv_name):
         header = lsvg_output.splitlines()[1]
     except IndexError as no_second_line:
         raise IndexError from no_second_line(
-            "Unable to get header (second line) of 'lsvg -l {vg_name}' "
-            "output. lsvg_output={lsvg_output}"
-            .format(vg_name=vg_name, lsvg_output=lsvg_output)
+            f"Unable to get header (second line) of lsvg -l {vg_name} output.\
+                lsvg_output={lsvg_output}"
         )
     headings = ['LV NAME', 'TYPE', 'LPs', 'PPs', 'PVs', 'LV STATE', 'MOUNT POINT']
     headings_indexes = []

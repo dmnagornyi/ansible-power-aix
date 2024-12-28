@@ -5,21 +5,20 @@ galaxy_info:
     Joseph de Joya
     Rae Yang
     Pedro V Torres
-  description: Ansible role for migrating an alternate disk to a higher AIX level.
+    Shreyansh Chamola
+  description: Ansible role for migrating the client(s) to a higher AIX level.
   company: IBM
 
   license: GPL-3.0-only
 
-  min_ansible_version: 2.9
+  min_ansible_version: "2.9"
 
   platforms:
     - name: AIX
       versions:
-        - 7.2
-        - 7.3
+        - "7.2"
 
   galaxy_tags:
     - aix
     - migration
     - nim
-  dependencies: []

@@ -5,6 +5,7 @@
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 from __future__ import absolute_import, division, print_function
+from ansible.module_utils.basic import AnsibleModule
 __metaclass__ = type
 
 ANSIBLE_METADATA = {'metadata_version': '1.1',
@@ -24,7 +25,7 @@ description:
 version_added: '1.1.0'
 requirements:
 - AIX >= 7.1 TL3
-- Python >= 2.7
+- Python >= 3.6
 - Root user or member of security group is required.
 options:
   force:
@@ -202,8 +203,6 @@ ansible_facts:
           elements: dict
 '''
 
-from ansible.module_utils.basic import AnsibleModule
-
 
 def main():
     # Options common to "normal", "service" and "both" dictionary keys
@@ -260,6 +259,7 @@ def main():
         ret, stdout, stderr = module.run_command(cmd, check_rc=True)
         results['stdout'] += stdout  # Save verbose output
         results['changed'] = True
+        results['stderr'] = stderr
 
     # Retrieve boot lists
     bootlists = {}

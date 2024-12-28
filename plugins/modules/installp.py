@@ -5,6 +5,9 @@
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 from __future__ import absolute_import, division, print_function
+import re
+from ansible.module_utils.basic import AnsibleModule
+
 __metaclass__ = type
 
 ANSIBLE_METADATA = {'metadata_version': '1.1',
@@ -22,7 +25,7 @@ description:
 version_added: '0.4.0'
 requirements:
 - AIX >= 7.1 TL3
-- Python >= 2.7
+- Python >= 3.6
 - 'Privileged user with authorization: B(aix.system.install)'
 options:
   action:
@@ -160,14 +163,14 @@ EXAMPLES = r'''
 
 - name: Install all filesets within the bos.net software package and expand file systems if necessary
   ibm.power_aix.installp:
-    extend_fs: yes
+    extend_fs: true
     device: /usr/sys/inst.images
     install_list: bos.net
 
 - name: Reinstall and commit the NFS software product option that is already installed on the system at the same level
   ibm.power_aix.installp:
-    commit: yes
-    force: yes
+    commit: true
+    force: true
     device: /dev/rmt0.1
     install_list: bos.net.nfs.client:4.1.0.0
 
@@ -242,9 +245,6 @@ stderr:
     type: str
     sample: 'installp: Device /dev/rfd0 could not be accessed.\nSpecify a valid device name.'
 '''
-
-from ansible.module_utils.basic import AnsibleModule
-import re
 
 
 def main():
@@ -367,15 +367,16 @@ def main():
     result['stderr'] = stderr
 
     if rc != 0:
-        result['msg'] = 'installp \'{0}\' failed.'.format(action)
+        result['msg'] = f'installp { action } failed.'
         module.fail_json(**result)
 
-    result['msg'] = 'installp \'{0}\' successful.'.format(action)
+    result['msg'] = f'installp { action } successful.'
     if action in ['apply', 'commit', 'reject', 'deinstall', 'cleanup']:
         result['changed'] = True
 
     # check if anything changed
-    pattern = r"(Already Installed|Not Installed|Not Committable|Not Rejectable|Nothing to Commit|0503-439)"
+    pattern = r"(Already Installed|Not Installed|Not Committable|\
+      Not Rejectable|Nothing to Commit|0503-439)"
     if not re.search(r"SUCCESSES", stdout) and\
             not re.search(r"SUCCESS", stderr) and\
             (re.search(pattern, stdout) or re.search(pattern, stderr)):

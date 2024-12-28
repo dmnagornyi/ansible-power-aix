@@ -25,7 +25,7 @@ description:
 version_added: '0.4.0'
 requirements:
 - AIX >= 7.1 TL3
-- Python >= 2.7
+- Python >= 3.6
 - User with root authority to run the nim command.
 - 'Privileged user with authorization:
   B(aix.system.install,aix.system.nim.config.server,aix.system.nim.stat)'
@@ -41,6 +41,7 @@ options:
     - C(script) to apply a script to customize NIM clients.
     - C(allocate) to allocate a resource to specified NIM clients.
     - C(deallocate) to deallocate a resource for specified NIM clients.
+    - C(install_fileset) to install filesets from the provided installp bundle.
     - C(bos_inst) to install BOS image to a given list of NIM clients.
     - C(define_script) to define a script NIM resource.
     - C(remove) to remove a specified NIM resource.
@@ -74,6 +75,10 @@ options:
     - C(latest_tl), C(latest_sp), C(next_tl) and C(next_sp) can be specified; based on the NIM
       server resources, nim will determine the actual oslevel necessary to update the targets;
       the update operation will be synchronous independently from C(asynchronous) value.
+    type: str
+  installp_bundle:
+    description:
+    - Specifies the installp bundle containing names of the filesets that need to be installed.
     type: str
   device:
     description:
@@ -149,7 +154,7 @@ EXAMPLES = r'''
   nim:
     action: script
     script: myscript
-    asynchronous: no
+    asynchronous: false
     targets: all
 
 - name: Query all standalone objects defined in a NIM master
@@ -332,10 +337,11 @@ def nim_exec(module, node, command):
 
     node = get_target_ipaddr(module, node)
 
-    rcmd = '( LC_ALL=C {0} ); echo rc=$?'.format(' '.join(command))
+    cmd = ' '.join(command)
+    rcmd = f'( LC_ALL=C { cmd } ); echo rc=$?'
     cmd = ['/usr/lpp/bos.sysmgt/nim/methods/c_rsh', node, rcmd]
 
-    module.debug('exec command:{0}'.format(cmd))
+    module.debug(f'exec command:{ cmd }')
 
     rc, stdout, stderr = module.run_command(cmd)
     if rc != 0:
@@ -347,7 +353,7 @@ def nim_exec(module, node, command):
         # remove the rc of c_rsh with echo $?
         stdout = re.sub(r'rc=[-\d]+\n$', '', stdout)
 
-    module.debug('exec command rc:{0}, output:{1}, stderr:{2}'.format(rc, stdout, stderr))
+    module.debug(f'exec command rc:{ rc }, output:{ stdout }, stderr:{ stderr }')
 
     return (rc, stdout, stderr)
 
@@ -377,9 +383,11 @@ def get_target_ipaddr(module, target):
                 try:
                     ipaddr = socket.getfqdn(match_if.group(1))
                 except OSError as exc:
-                    module.log('NIM - Error: Cannot get FQDN for {0}: {1}'.format(match_if.group(1), exc))
+                    matched = match_if.group(1)
+                    module.log(f'NIM - Error: Cannot get FQDN for { matched }: { exc }')
             else:
-                module.debug('Parsing of interface if1 failed, got: \'{0}\''.format(results['nim_node'][type][target]['ip']))
+                debug_ip = results['nim_node'][type][target]['ip']
+                module.debug(f'Parsing of interface if1 failed, got: { debug_ip }')
         results['nim_node'][type][target]['ip'] = ipaddr
 
     return ipaddr
@@ -406,13 +414,11 @@ def get_nim_type_info(module, lpar_type):
         results['rc'] = rc
         results['stdout'] = stdout
         results['stderr'] = stderr
-        results['msg'] = 'Cannot get NIM {0} client information.'.format(lpar_type)
+        results['msg'] = f'Cannot get NIM { lpar_type } client information.'
 
-        module.log('NIM - Error: ' + results['msg'])
-        module.log('cmd: {0}'.format(results['cmd']))
-        module.log('rc: {0}'.format(rc))
-        module.log('stdout: {0}'.format(stdout))
-        module.log('stderr: {0}'.format(stderr))
+        module.log(f'rc: { rc }')
+        module.log(f'stdout: { stdout }')
+        module.log(f'stderr: { stderr }')
         module.fail_json(**results)
 
     info_hash = build_dict(module, stdout)
@@ -465,9 +471,9 @@ def get_nim_master_info(module):
         results['stderr'] = stderr
         results['msg'] = 'Cannot get NIM master information.'
         module.log('NIM - Error: ' + results['msg'])
-        module.log('rc: {0}'.format(rc))
-        module.log('stdout: {0}'.format(stdout))
-        module.log('stderr: {0}'.format(stderr))
+        module.log(f'rc: {rc}')
+        module.log(f'stdout: { stdout }')
+        module.log(f'stderr: { stderr }')
         module.fail_json(**results)
 
     # Retrieve associated Cstate
@@ -505,10 +511,56 @@ def get_oslevels(module, targets):
     for process in threads:
         process.join(300)  # wait 5 min for c_rsh to timeout
         if process.is_alive():
-            module.log('NIM - WARNING: {0} Not responding'.format(process))
+            module.log(f'NIM - WARNING: { process } Not responding')
 
-    module.log('NIM - oslevels: {0}'.format(oslevels))
+    module.log(f'NIM - oslevels: { oslevels }')
     return oslevels
+
+
+def check_if_allocated(module, provided_lpp_source, targets):
+    """
+    Check if the lpp source is allocated to the provided targets.
+
+    arguments:
+        lpp_source (str) : LPP Source
+        targtes (list) : list of targets that need to be checked
+
+    returns:
+        new_targets (list) : Updated list having only the targets that
+        have the specified lpp_source allocated to them.
+    """
+    cmd = "lsnim -t lpp_source"
+
+    targets = expand_targets(targets)
+
+    if not targets:
+        results['msg'] = f"No matching target found for targets \'{ module.params['targets'] }\'."
+        module.log('NIM - Error: ' + results['msg'])
+        module.fail_json(**results)
+
+    new_targets = []
+    cmd_failed = []
+
+    for target in targets:
+        cmd += f" {target}"
+        rc, stdout, stderr = module.run_command(cmd)
+        results['cmd'] = cmd
+        results['stderr'] = stderr
+        results['stdout'] = stdout
+        if rc:
+            cmd_failed.append(target)
+            continue
+        stdout_lines = stdout.splitlines()
+        stdout_list = ' '.join(stdout_lines).split()
+        if provided_lpp_source in stdout_list:
+            new_targets.append(target)
+
+    results['msg'] += f"Could not get allocation information about the following targets: {cmd_failed}"
+
+    if len(cmd_failed) == len(targets):
+        module.fail_json(**results)
+
+    return new_targets
 
 
 def run_oslevel_cmd(module, target, levels):
@@ -530,19 +582,20 @@ def run_oslevel_cmd(module, target, levels):
         rc, stdout, stderr = nim_exec(module, target, cmd)
 
     if rc == 0:
-        module.debug('{0} oslevel stdout: {1}'.format(target, stdout))
+        module.debug(f'{ target } oslevel stdout: { stdout }')
         if stderr.rstrip():
-            module.log('NIM - \'{0}\' command stderr: {1}'.format(' '.join(cmd), stderr))
+            module.log(f'NIM command stderr: { stderr }')
 
         # return stdout only ... stripped!
         levels[target] = stdout.rstrip()
     else:
-        msg = 'Failed to get oslevel on {0}. Command \'{1}\' failed'.format(target, ' '.join(cmd))
-        results['meta']['messages'].append(msg + ', stderr: \'{0}\''.format(stderr))
+        command = ' '.join(cmd)
+        msg = f'Failed to get oslevel on { target }. Command \'{ command }\' failed'
+        results['meta']['messages'].append(msg + f', stderr: \'{ stderr }\'')
         module.log('NIM - Error: ' + msg)
-        module.log('rc: {0}'.format(rc))
-        module.log('stdout: {0}'.format(stdout))
-        module.log('stderr: {0}'.format(stderr))
+        module.log(f'rc: { rc }')
+        module.log(f'stdout: { stdout }')
+        module.log(f'stderr: { stderr }')
 
 
 def get_nim_lpp_source(module):
@@ -563,10 +616,6 @@ def get_nim_lpp_source(module):
         results['stdout'] = stdout
         results['stderr'] = stderr
         results['msg'] = 'Cannot list lpp_source resource.'
-        module.log('NIM - Error: ' + results['msg'])
-        module.log('rc: {0}'.format(rc))
-        module.log('stdout: {0}'.format(stdout))
-        module.log('stderr: {0}'.format(stderr))
         module.fail_json(**results)
 
     # lpp_source list
@@ -594,21 +643,25 @@ def build_nim_node(module):
 
     # Build nim lpp_source list
     results['nim_node']['lpp_source'] = get_nim_lpp_source(module)
-    module.debug('NIM lpp source list: {0}'.format(results['nim_node']['lpp_source']))
+    debug_lpp_src = results['nim_node']['lpp_source']
+    module.debug(f'NIM lpp source list: { debug_lpp_src }')
 
     # Build nim clients info
     results['nim_node']['standalone'] = get_nim_type_info(module, 'standalone')
-    module.debug('NIM standalone clients: {0}'.format(results['nim_node']['standalone']))
+    debug_standalone = results['nim_node']['standalone']
+    module.debug(f'NIM standalone clients: { debug_standalone }')
 
     results['nim_node']['vios'] = get_nim_type_info(module, 'vios')
-    module.debug('NIM VIOS clients: {0}'.format(results['nim_node']['vios']))
+    debug_vios = results['nim_node']['vios']
+    module.debug(f'NIM VIOS clients: { debug_vios }')
 
     # Build master info
     cstate = get_nim_master_info(module)
     results['nim_node']['master'] = {}
     results['nim_node']['master']['type'] = 'master'
     results['nim_node']['master']['Cstate'] = cstate
-    module.debug('NIM master: {0}'.format(results['nim_node']['master']))
+    debug_master = results['nim_node']['master']
+    module.debug(f'NIM master: { debug_master }')
 
 
 def expand_targets(targets):
@@ -666,10 +719,10 @@ def expand_targets(targets):
             name = rmatch.group(1)
 
             for curr_name in results['nim_node']['standalone']:
-                if re.match(r"^%s\.*" % name, curr_name):
+                if re.match(rf"^{name}\.*", curr_name):
                     clients.append(curr_name)
             for curr_name in results['nim_node']['vios']:
-                if re.match(r"^%s\.*" % name, curr_name):
+                if re.match(rf"^{name}\.*", curr_name):
                     clients.append(curr_name)
             continue
 
@@ -730,24 +783,24 @@ def perform_customization(module, lpp_source, target, is_async):
         results['meta'][target]['stdout'] = stdout
         results['meta'][target]['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(cmd))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: { cmd }')
+    module.log(f'rc: { rc }')
+    module.log(f'stdout: { stdout }')
+    module.log(f'stderr: { stderr }')
 
     if not is_async:
         for line in stdout.rstrip().split('\n'):
             line = line.rstrip()
             matched = re.match(r"^Filesets processed:.*?[0-9]+ of [0-9]+", line)
             if matched:
-                results['meta'][target]['messages'].append('\033[2K\r{0}'.format(line))
+                results['meta'][target]['messages'].append(f'\033[2K\r{line}')
                 continue
             matched = re.match(r"^Finished processing all filesets.", line)
             if matched:
-                results['meta'][target]['messages'].append('\033[2K\r{0}'.format(line))
+                results['meta'][target]['messages'].append(f'\033[2K\r{line}')
                 continue
             if line:
-                results['meta'][target]['messages'].append('{0}'.format(line))
+                results['meta'][target]['messages'].append(f'{line}')
 
     for line in stdout.rstrip().split('\n'):
         line = line.rstrip()
@@ -775,6 +828,80 @@ def perform_customization(module, lpp_source, target, is_async):
     return rc
 
 
+def install_filesets(module, params):
+    """
+    Install filesets on the specified nim client.
+
+    arguments:
+        module  (dict): The Ansible module.
+        target   (str): The nim client on which installation needs to be performed.
+    return:
+        a return code (0 if OK)
+    """
+
+    module.debug('NIM install filesets')
+
+    lpp_source = params['lpp_source']
+    installp_bundle = params['installp_bundle']
+
+    target_list = expand_targets(params['targets'])
+    if not target_list:
+        results['msg'] = f"No matching target found for targets \'{ params['targets'] }\'."
+        module.log('NIM - Error: ' + results['msg'])
+        module.fail_json(**results)
+
+    changed_val = 0
+
+    for target in target_list:
+        # Allocate the installp bundle
+
+        alloc_cmd = ['nim', '-o', 'allocate',
+                     '-a', 'lpp_source=' + lpp_source,
+                     '-a', 'installp_bundle=' + installp_bundle]
+        alloc_cmd.append(target)
+
+        rc, stdout, stderr = module.run_command(alloc_cmd)
+
+        results['meta'][target] = {}
+        results['meta'][target]['cmd'] = ' '.join(alloc_cmd)
+        results['meta'][target]['rc'] = rc
+        results['meta'][target]['stdout'] = stdout
+        results['meta'][target]['stderr'] = stderr
+
+        if rc:
+            msg = f"Couldn't install filesets - Allocation operation failed on {target}."
+            results['meta']['messages'].append(msg)
+            module.log('NIM - Error: ' + msg)
+            results['status'][target] = 'FAILURE'
+            continue
+
+        # Perform customization
+
+        cust_cmd = ['nim', '-o', 'cust']
+        cust_cmd.append(target)
+
+        rc, stdout, stderr = module.run_command(cust_cmd)
+
+        results['meta'][target]['cmd'] = ' '.join(cust_cmd)
+        results['meta'][target]['rc'] = rc
+        results['meta'][target]['stdout'] = stdout
+        results['meta'][target]['stderr'] = stderr
+
+        if rc:
+            msg = f"Couldn't install filesets - Customization operation failed on {target}."
+            results['meta']['messages'].append(msg)
+            module.log('NIM - Error: ' + msg)
+            results['status'][target] = 'FAILURE'
+        else:
+            if stdout.split()[-1] == "SUCCESS":
+                changed_val = 1
+            results['status'][target] = 'SUCCESS'
+
+    # Set changed to true if the filesets were installed, and were not already present
+    if changed_val:
+        results['changed'] = True
+
+
 def list_fixes(module, target):
     """
     Get the list of interim fixes for a specified nim client.
@@ -791,16 +918,17 @@ def list_fixes(module, target):
 
     fixes = []
     cmd = ['/usr/sbin/emgr', '-l']
-    module.log('NIM - EMGR list on {0} - Command:{1}'.format(target, cmd))
+    module.log(f'NIM - EMGR list on { target } - Command:{ cmd }')
 
     if target == 'master':
         rc, stdout, stderr = module.run_command(cmd)
     else:
         rc, stdout, stderr = nim_exec(module, target, cmd)
 
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: { cmd }')
+    module.log(f'rc: { rc }')
+    module.log(f'stdout: { stdout }')
+    module.log(f'stderr: { stderr }')
 
     # Best effort: let's try parsing
     for line in stdout.rstrip().split('\n'):
@@ -808,16 +936,17 @@ def list_fixes(module, target):
         line_array = line.split(' ')
         matched = re.match(r"[0-9]", line_array[0])
         if matched:
-            module.debug('EMGR list - adding fix {0} to fixes list'.format(line_array[2]))
+            debug_fix = line_array[2]
+            module.debug(f'EMGR list - adding fix { debug_fix } to fixes list')
             fixes.append(line_array[2])
 
     if rc != 0:
-        msg = 'Failed to list fixes with emgr. Command \'{0}\' failed.'.format(cmd)
+        msg = f'Failed to list fixes with emgr. Command \'{ cmd }\' failed.'
         module.log('NIM - Error: ' + msg)
         results['meta'][target]['messages'].append(msg)
-        results['meta'][target]['messages'].append('rc: {0}'.format(rc))
-        results['meta'][target]['messages'].append('stdout: {0}'.format(stdout))
-        results['meta'][target]['messages'].append('stderr: {0}'.format(stderr))
+        results['meta'][target]['messages'].append(f'rc: {rc}')
+        results['meta'][target]['messages'].append(f'stdout: {stdout}')
+        results['meta'][target]['messages'].append(f'stderr: {stderr}')
 
     return (rc, fixes)
 
@@ -835,7 +964,8 @@ def remove_fix(module, target, fix):
     """
 
     cmd = ['/usr/sbin/emgr', '-r', '-L', fix]
-    module.log('EMGR remove - Command:{0}'.format(cmd))
+    cmd = ' '.join(cmd)
+    module.log(f'EMGR remove - Command:{ cmd }')
 
     if target == 'master':
         rc, stdout, stderr = module.run_command(cmd)
@@ -843,20 +973,17 @@ def remove_fix(module, target, fix):
         rc, stdout, stderr = nim_exec(module, target, cmd)
 
     if rc != 0:
-        msg = 'Failed to remove fix: {0}. Command: {1} failed.'.format(fix, ' '.join(cmd))
-        module.log('NIM - Error: On {0} '.format(target) + msg)
-        module.log('rc: {0}'.format(rc))
+        msg = f'Failed to remove fix: {fix}. Command: {cmd} failed.'
         results['meta']['target']['messages'].append(msg)
-        results['meta']['target']['messages'].append('stdout: {0}'.format(stdout))
-        results['meta']['target']['messages'].append('stderr: {0}'.format(stderr))
+        results['meta']['target']['messages'].append(f'stdout: {stdout}')
+        results['meta']['target']['messages'].append(f'stderr: {stderr}')
     else:
-        msg = 'Fix successfully removed: {0}.'.format(fix)
-        module.log('NIM - On {0} '.format(target) + msg)
+        msg = f'Fix successfully removed: {fix}.'
         results['meta']['target']['messages'].append(msg)
         results['changed'] = True
 
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'stdout: { stdout }')
+    module.log(f'stderr: { stderr }')
 
     return rc
 
@@ -874,7 +1001,7 @@ def find_resource_by_client(module, lpp_type, lpp_time, oslevel_elts):
         the lpp_source found or the current oslevel if not found
     """
 
-    module.debug('NIM - find resource: {0} {1}'.format(lpp_time, lpp_type))
+    module.debug(f'NIM - find resource: { lpp_time } { lpp_type}')
 
     lpp_source = ''
     lpp_source_list = sorted(results['nim_node']['lpp_source'].keys())
@@ -901,12 +1028,14 @@ def find_resource_by_client(module, lpp_type, lpp_time, oslevel_elts):
 
     if (lpp_source is None) or (not lpp_source.strip()):
         # setting lpp_source to current oslevel if not found
-        lpp_source = '{0}-{1}-{2}-{3}-lpp_source'.format(oslevel_elts[0], oslevel_elts[1], oslevel_elts[2], oslevel_elts[3])
-        module.debug('NIM - find resource: server already to the {0} {1}, or no lpp_source were found, {2} will be utilized'
-                     .format(lpp_time, lpp_type, lpp_source))
+        part1 = oslevel_elts[0]
+        part2 = oslevel_elts[1]
+        part3 = oslevel_elts[2]
+        part4 = oslevel_elts[3]
+        lpp_source = f'{part1}-{part2}-{part3}-{part4}-lpp_source'
+        module.debug(f'NIM - find resource: server already to the {lpp_time} {lpp_type}, or no lpp_source were found, {lpp_source} will be utilized')
     else:
-        module.debug('NIM - find resource: found the {0} lpp_source, {1} will be utilized'
-                     .format(lpp_time, lpp_source))
+        module.debug(f'NIM - find resource: found the {lpp_time} lpp_source, {lpp_source} will be utilized')
 
     return lpp_source
 
@@ -928,7 +1057,7 @@ def check_alt_disk(module, alt_disk_update_name, target_list):
 
     target_miss = []
     for target in target_list:
-        rc, stdout, stderr = nim_exec(module, target, cmd)
+        rc = nim_exec(module, target, cmd)[0]
         if rc != 0:
             target_miss .append(target)
 
@@ -951,6 +1080,7 @@ def nim_update(module, params):
 
     lpp_source = params['lpp_source']
     alt_disk_update_name = params['alt_disk_update_name']
+    targets = params['targets']
 
     async_update = 'no'
     if params['asynchronous']:
@@ -959,8 +1089,7 @@ def nim_update(module, params):
     else:
         log_async = 'synchronous'
 
-    module.log('NIM - {0} update operation on {1} with {2} lpp_source'
-               .format(log_async, params['targets'], lpp_source))
+    module.log(f'NIM - { log_async } update operation on { targets } with { lpp_source } lpp_source')
 
     if (params['asynchronous'] and (lpp_source == 'latest_tl'
                                     or lpp_source == 'latest_sp'
@@ -971,7 +1100,7 @@ def nim_update(module, params):
 
     target_list = expand_targets(params['targets'])
     if not target_list:
-        results['msg'] = 'No matching target found for targets \'{0}\'.'.format(params['targets'])
+        results['msg'] = f'No matching target found for targets \'{ targets }\'.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
@@ -981,7 +1110,7 @@ def nim_update(module, params):
         unavail_targets = []
 
     results['targets'] = list(target_list)
-    module.debug('NIM - Target list: {0}'.format(target_list))
+    module.debug(f'NIM - Target list: { target_list }')
     for target in results['targets']:
         if target in results['nim_node']['vios']:
             target_list.remove(target)
@@ -1011,19 +1140,20 @@ def nim_update(module, params):
         module.log('NIM - ' + msg)
         for target in target_list:
             rc, fixes = list_fixes(module, target)
-            msg = 'Will remove as many interim fixes we can: {0}'.format(fixes)
+            msg = f'Will remove as many interim fixes we can: {fixes}'
             results['meta']['messages'].append(msg)
-            module.log('NIM - On {0} '.format(target) + msg)
             for fix in fixes:
                 remove_fix(module, target, fix)
 
     if async_update == 'yes':   # async update
         if lpp_source not in results['nim_node']['lpp_source']:
-            results['msg'] = 'Cannot find lpp_source \'{0}\'.'.format(results['nim_node']['lpp_source'])
+            debug_lpp_src = results['nim_node']['lpp_source']
+            results['msg'] = f'Cannot find lpp_source \'{ debug_lpp_src }\'.'
             module.log('NIM - Error: ' + results['msg'])
             module.fail_json(**results)
 
-        msg = 'Asynchronous software customization for client(s) {0} with resource {1}.'.format(','.join(target_list), lpp_source)
+        msg_target_list = ','.join(target_list)
+        msg = f'Asynchronous software customization for client(s) { msg_target_list } with resource { lpp_source }.'
         results['meta']['messages'].append(msg)
         module.log('NIM - ' + msg)
 
@@ -1050,9 +1180,11 @@ def nim_update(module, params):
             else:
                 cur_oslevel = results['nim_node']['standalone'][target]['oslevel']
             if (cur_oslevel is None) or (not cur_oslevel.strip()) or cur_oslevel == 'timedout':
-                msg = 'Invalid oslevel got: \'{0}\'.'.format(cur_oslevel)
+                msg = f'Invalid oslevel got: \'{ cur_oslevel }\'.'
                 results['meta'][target]['messages'].append(msg)
-                module.log('NIM - WARNING: On {0} '.format(target) + msg)
+                module.log(f'NIM - WARNING: On { target } with msg: { msg } ')
+                results['msg'] += f"{target} - {results['meta'][target]['messages']}"
+                results['status'][target] = 'FAILURE'
                 continue
             cur_oslevel_elts = cur_oslevel.split('-')
 
@@ -1065,12 +1197,13 @@ def nim_update(module, params):
                 lpp_type = lpp_source_array[1]
 
                 new_lpp_source = find_resource_by_client(module, lpp_type, lpp_time, cur_oslevel_elts)
-                msg = 'Using lpp_source: {0}'.format(new_lpp_source)
+                msg = f'Using lpp_source: { new_lpp_source }'
                 results['meta']['messages'].append(msg)
                 module.debug('NIM - ' + msg)
             else:
                 if lpp_source not in results['nim_node']['lpp_source']:
-                    results['msg'] = 'Cannot find lpp_source \'{0}\' in \'{1}\'.'.format(lpp_source, results['nim_node']['lpp_source'])
+                    msg_lpp_src = results['nim_node']['lpp_source']
+                    results['msg'] = f'Cannot find lpp_source \'{ lpp_source }\' in \'{ msg_lpp_src }\'.'
                     module.log('NIM - Error: ' + results['msg'])
                     module.fail_json(**results)
                 else:
@@ -1082,27 +1215,34 @@ def nim_update(module, params):
             if matched:
                 oslevel_elts = matched.group(1).split('-')
             else:
-                msg = 'Cannot get oslevel from lpp source name: {0}'.format(new_lpp_source)
+                msg = f'Cannot get oslevel from lpp source name: { new_lpp_source }'
                 results['meta'][target]['messages'].append(msg)
-                module.log('NIM - WARNING: On {0} '.format(target) + msg)
+                module.log(f'NIM - WARNING: On { target} with msg: { msg } ')
+                results['msg'] += f"{target} - {results['meta'][target]['messages']}"
+                results['status'][target] = 'FAILURE'
                 continue
 
+            full_elts = '-'.join(oslevel_elts)
             if cur_oslevel_elts[0] != oslevel_elts[0]:
-                msg = 'Has a different release number than {0}, got {1}'.format('-'.join(oslevel_elts), cur_oslevel_elts)
+                msg = f'Has a different release number than { full_elts }, got { cur_oslevel }'
                 results['meta'][target]['messages'].append(msg)
-                module.log('NIM - WARNING: {0} '.format(target) + msg)
+                module.log(f'NIM - WARNING: { target } with msg: { msg } ')
+                results['msg'] += f"{target} - {results['meta'][target]['messages']}"
+                results['status'][target] = 'FAILURE'
                 continue
             if (cur_oslevel_elts[1] > oslevel_elts[1] or cur_oslevel_elts[1] == oslevel_elts[1] and cur_oslevel_elts[2] >= oslevel_elts[2]):
-                msg = 'Already at same or higher level: {0}, got: {1}'.format('-'.join(oslevel_elts), cur_oslevel_elts)
+                msg = f'Already at same or higher level: {full_elts}, got: {cur_oslevel_elts}'
                 results['meta'][target]['messages'].append(msg)
-                module.log('NIM - {0} '.format(target) + msg)
+                module.log(f'NIM - { target} with msg: { msg } ')
+                results['msg'] += f"{target} - {results['meta'][target]['messages']}"
                 continue
 
-            msg = 'Synchronous software customization from {0} to {1}.'.format(cur_oslevel, '-'.join(oslevel_elts))
+            msg = f'Synchronous software customization from {cur_oslevel} to {full_elts}.'
             results['meta'][target]['messages'].append(msg)
-            module.log('NIM - On {0} '.format(target) + msg)
+            module.log(f'NIM - On {target} ' + msg)
 
             rc = perform_customization(module, new_lpp_source, target, False)
+            results['msg'] += f"{target} - {results['meta'][target]['messages']}"
             if rc:
                 results['status'][target] = 'FAILURE'
             else:
@@ -1118,20 +1258,22 @@ def nim_maintenance(module, params):
         params  (dict): The module parameters for the command.
     """
 
-    module.log('NIM - maintenance operation on {0}'.format(params['targets']))
+    targets = params['targets']
+    module.log(f'NIM - maintenance operation on { targets }')
 
     results['targets'] = expand_targets(params['targets'])
     if not results['targets']:
-        results['msg'] = 'No matching target found for targets \'{0}\'.'.format(params['targets'])
+        results['msg'] = f'No matching target found for targets \'{ targets }\'.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
-    module.debug('NIM - Target list: {0}'.format(results['targets']))
+    debug_targets = results['targets']
+    module.debug(f'NIM - Target list: {debug_targets}')
 
     flag = '-c'  # initialized to commit flag
 
     for target in results['targets']:
-        module.log('NIM - perform maintenance operation for client {0}'.format(target))
+        module.log(f'NIM - perform maintenance operation for client { target }')
         results['meta'][target] = {'messages': []}  # first time init
         results['status'][target] = ''  # first time init
 
@@ -1158,21 +1300,21 @@ def nim_maintenance(module, params):
         results['meta'][target]['stderr'] = stderr
 
         if rc != 0:
-            msg = 'maintenance operation failed on {0}.'.format(target)
+            msg = f'maintenance operation failed on {target}.'
             results['meta']['messages'].append(msg)
             module.log('NIM - Error: ' + msg)
             results['status'][target] = 'FAILURE'
         else:
-            msg = 'maintenance operation successfull on {0}.'.format(target)
+            msg = f'maintenance operation successfull on {target}.'
             results['meta']['messages'].append(msg)
             module.log('NIM - ' + msg)
             results['changed'] = True
             results['status'][target] = 'SUCCESS'
 
-        module.log('cmd: {0}'.format(' '.join(cmd)))
-        module.log('rc: {0}'.format(rc))
-        module.log('stdout: {0}'.format(stdout))
-        module.log('stderr: {0}'.format(stderr))
+        module.log(f'cmd: { cmd }')
+        module.log(f'rc: { rc }')
+        module.log(f'stdout: { stdout }')
+        module.log(f'stderr: { stderr }')
 
 
 def nim_master_setup(module, params):
@@ -1187,7 +1329,8 @@ def nim_master_setup(module, params):
         Exits with fail_json in case of error
     """
 
-    module.log('NIM - master setup operation using {0} device'.format(params['device']))
+    device = params['device']
+    module.log(f'NIM - master setup operation using { device } device')
 
     cmd = ['nim_master_setup', '-B',
            '-a', 'mk_resource=no',
@@ -1200,10 +1343,10 @@ def nim_master_setup(module, params):
     results['stdout'] = stdout
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(results['cmd']))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: { cmd }')
+    module.log(f'rc: { rc }')
+    module.log(f'stdout: { stdout }')
+    module.log(f'stderr: { stderr }')
 
     if rc != 0:
         results['msg'] = 'Failed to setup the NIM master.'
@@ -1241,7 +1384,8 @@ def nim_check(module, params):
         # Get the oslevel for specified targets only
         results['targets'] = expand_targets(params['targets'])
         if not results['targets']:
-            results['msg'] = 'No matching target found for targets \'{0}\'.'.format(params['targets'])
+            msg_targets = params['targets']
+            results['msg'] = f'No matching target found for targets \'{ msg_targets }\'.'
             module.log('NIM - Error: ' + results['msg'])
             module.fail_json(**results)
 
@@ -1266,21 +1410,22 @@ def nim_compare(module, params):
         Exits with fail_json in case of error
     """
 
-    module.log('NIM - installation inventory comparison for {0} clients'.format(params['targets']))
+    targets = params['targets']
+    module.log(f'NIM - installation inventory comparison for { targets } clients')
 
     results['targets'] = expand_targets(params['targets'])
     if not results['targets']:
-        results['msg'] = 'No matching target found for targets \'{0}\'.'.format(params['targets'])
+        results['msg'] = f'No matching target found for targets \'{ targets }\'.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
-    module.debug('NIM - Target list: {0}'.format(results['targets']))
+    module.debug(f'NIM - Target list: { targets }')
 
     cmd = ['niminv', '-o', 'invcmp',
            '-a', 'targets=' + ','.join(results['targets']),
            '-a', 'base=any']
 
-    module.debug('NIM - Command:{0}'.format(cmd))
+    module.debug(f'NIM - Command:{ cmd }')
 
     rc, stdout, stderr = module.run_command(cmd)
 
@@ -1289,10 +1434,10 @@ def nim_compare(module, params):
     results['stdout'] = stdout
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(results['cmd']))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: { cmd }')
+    module.log(f'rc: { rc }')
+    module.log(f'stdout: { stdout }')
+    module.log(f'stderr: { stderr }')
 
     if rc != 0:
         results['msg'] = 'Failed to compare installation inventories.'
@@ -1319,32 +1464,36 @@ def nim_script(module, params):
         async_script = 'no'
         log_async = 'synchronous'
 
-    module.log('NIM - {0} customize operation on {1} with {2} script'.format(log_async, params['targets'], params['script']))
+    params_targets = params['targets']
+    params_scripts = params['script']
+    module.log(f'NIM - {log_async} customize operation on {params_targets} with {params_scripts} script')
 
     results['targets'] = expand_targets(params['targets'])
     if not results['targets']:
-        results['msg'] = 'No matching target found for targets \'{0}\'.'.format(params['targets'])
+        results['msg'] = f'No matching target found for targets \'{params_targets}\'.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
-    module.debug('NIM - Target list: {0}'.format(results['targets']))
+    res_targets = results['targets']
+    module.debug(f'NIM - Target list: {res_targets}')
 
     cmd = ['nim', '-o', 'cust',
            '-a', 'script=' + params['script'],
            '-a', 'async=' + async_script]
     cmd += results['targets']
+    cmd = ' '.join(cmd)
 
     rc, stdout, stderr = module.run_command(cmd)
 
-    results['cmd'] = ' '.join(cmd)
+    results['cmd'] = cmd
     results['rc'] = rc
     results['stdout'] = stdout
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(results['cmd']))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: {cmd}')
+    module.log(f'rc: {rc}')
+    module.log(f'stdout: {stdout}')
+    module.log(f'stderr: {stderr}')
 
     if rc != 0:
         results['msg'] = 'Failed to apply script.'
@@ -1364,32 +1513,49 @@ def nim_allocate(module, params):
     note:
         Exits with fail_json in case of error
     """
+    params_targets = params['targets']
+    params_lpp_source = params['lpp_source']
 
-    module.log('NIM - allocate operation on {0} for {1} lpp source'.format(params['targets'], params['lpp_source']))
+    module.log(f'NIM - allocate operation on {params_targets} for {params_lpp_source} lpp source')
 
-    results['targets'] = expand_targets(params['targets'])
-    if not results['targets']:
-        results['msg'] = 'No matching target found for targets \'{0}\'.'.format(params['targets'])
+    alloc_targets = expand_targets(params['targets'])
+
+    if not alloc_targets:
+        results['msg'] = f'No matching target found for targets \'{params_targets}\'.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
-    module.debug('NIM - Target list: {0}'.format(results['targets']))
+    already_allocated = check_if_allocated(module, params_lpp_source, params_targets)
+
+    if len(already_allocated):
+        results['msg'] += f"Resource is already allocated to: {already_allocated}."
+
+    for target in already_allocated:
+        alloc_targets.remove(target)
+
+    if len(alloc_targets) == 0:
+        results['msg'] += " No need to allocate again."
+        module.exit_json(**results)
+
+    res_targets = alloc_targets
+    module.debug(f'NIM - Target list: {res_targets}')
 
     cmd = ['nim', '-o', 'allocate',
            '-a', 'lpp_source=' + params['lpp_source']]
-    cmd += results['targets']
+    cmd += alloc_targets
 
+    cmd = ' '.join(cmd)
     rc, stdout, stderr = module.run_command(cmd)
 
-    results['cmd'] = ' '.join(cmd)
+    results['cmd'] = cmd
     results['rc'] = rc
     results['stdout'] = stdout
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(results['cmd']))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: {cmd}')
+    module.log(f'rc: {rc}')
+    module.log(f'stdout: {stdout}')
+    module.log(f'stderr: {stderr}')
 
     if rc != 0:
         results['msg'] = 'Failed to allocate resource.'
@@ -1409,34 +1575,42 @@ def nim_deallocate(module, params):
     note:
         Exits with fail_json in case of error
     """
+    params_targets = check_if_allocated(module, params['lpp_source'], params['targets'])
 
-    module.log('NIM - deallocate operation on {0} for {1} lpp source'.format(params['targets'], params['lpp_source']))
+    if not len(params_targets):
+        results['msg'] += "Resource is not allocated to the provided targets, no need to deallocate."
+        module.exit_json(**results)
+
+    params_lpp_source = params['lpp_source']
+    module.log(f'NIM - deallocate operation on {params_targets} for {params_lpp_source} lpp source')
 
     results['targets'] = expand_targets(params['targets'])
     if not results['targets']:
-        results['msg'] = 'No matching target found for targets \'{0}\'.'.format(params['targets'])
+        results['msg'] = f'No matching target found for targets \'{params_targets}\'.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
-    module.debug('NIM - Target list: {0}'.format(results['targets']))
+    res_targets = results['targets']
+    module.debug(f'NIM - Target list: {res_targets}')
 
     cmd = ['nim', '-o', 'deallocate',
            '-a', 'lpp_source=' + params['lpp_source']]
-    cmd += results['targets']
+    cmd += params_targets
 
-    module.debug('NIM - Command:{0}'.format(cmd))
+    cmd = ' '.join(cmd)
+    module.debug(f'NIM - Command:{cmd}')
 
     rc, stdout, stderr = module.run_command(cmd)
 
-    results['cmd'] = ' '.join(cmd)
+    results['cmd'] = cmd
     results['rc'] = rc
     results['stdout'] = stdout
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(results['cmd']))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: {cmd}')
+    module.log(f'rc: {rc}')
+    module.log(f'stdout: {stdout}')
+    module.log(f'stderr: {stderr}')
 
     if rc != 0:
         results['msg'] = 'Failed to deallocate resource.'
@@ -1459,16 +1633,18 @@ def nim_bos_inst(module, params):
         Exits with fail_json in case of error
     """
 
-    module.log('NIM - bos_inst operation on {0} using {1} resource group'
-               .format(params['targets'], params['group']))
+    params_targets = params['targets']
+    params_group = params['group']
+    module.log(f'NIM - bos_inst operation on {params_targets} using {params_group} resource group')
 
     results['targets'] = expand_targets(params['targets'])
     if not results['targets']:
-        results['msg'] = 'No matching target found for targets \'{0}\'.'.format(params['targets'])
+        results['msg'] = f'No matching target found for targets \'{params_targets}\'.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
-    module.debug('NIM - Target list: {0}'.format(results['targets']))
+    res_targets = results['targets']
+    module.debug(f'NIM - Target list: {res_targets}')
 
     cmd = ['nim', '-o', 'bos_inst',
            '-a', 'source=mksysb',
@@ -1477,18 +1653,19 @@ def nim_bos_inst(module, params):
         cmd += ['-a', 'script=' + params['script']]
     cmd += ['-a', 'boot_client=' + ('yes' if params['boot_client'] else 'no')]
     cmd += results['targets']
+    cmd = ' '.join(cmd)
 
     rc, stdout, stderr = module.run_command(cmd)
 
-    results['cmd'] = ' '.join(cmd)
+    results['cmd'] = cmd
     results['rc'] = rc
     results['stdout'] = stdout
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(results['cmd']))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: {cmd}')
+    module.log(f'rc: {rc}')
+    module.log(f'stdout: {stdout}')
+    module.log(f'stderr: {stderr}')
 
     if rc != 0:
         results['msg'] = 'Failed to BOS install.'
@@ -1510,14 +1687,16 @@ def nim_define_script(module, params):
         Exits with fail_json in case of error
     """
 
-    module.log('NIM - define script operation for {0} resource with location {1}'.format(params['resource'], params['location']))
+    params_resource = params['resource']
+    params_location = params['location']
+    module.log(f'NIM - define script operation for {params_resource} resource with location {params_location}')
 
     # Check if the script already exists
     scripts = get_nim_type_info(module, 'script')
 
     if params['resource'] in scripts:
         if params['location'] == scripts[params['resource']]['location'] and scripts[params['resource']]['server'] == 'master':
-            msg = 'script resource \'{0}\' already exists.'.format(params['resource'])
+            msg = f'script resource \'{params_resource}\' already exists.'
             results['meta']['messages'].append(msg)
             module.log('NIM - ' + msg)
             return
@@ -1528,17 +1707,18 @@ def nim_define_script(module, params):
            '-a', 'server=master',
            params['resource']]
 
+    cmd = ' '.join(cmd)
     rc, stdout, stderr = module.run_command(cmd)
 
-    results['cmd'] = ' '.join(cmd)
+    results['cmd'] = cmd
     results['rc'] = rc
     results['stdout'] = stdout
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(results['cmd']))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: {cmd}')
+    module.log(f'rc: {rc}')
+    module.log(f'stdout: {stdout}')
+    module.log(f'stderr: {stderr}')
 
     if rc != 0:
         results['msg'] = 'Failed to define script resource.'
@@ -1560,21 +1740,23 @@ def nim_remove(module, params):
         Exits with fail_json in case of error
     """
 
-    module.log('NIM - remove operation on {0} resource'.format(params['resource']))
+    params_resource = params['resource']
+    module.log(f'NIM - remove operation on {params_resource} resource')
 
     cmd = ['nim', '-o', 'remove', params['resource']]
 
+    cmd = ' '.join(cmd)
     rc, stdout, stderr = module.run_command(cmd)
 
-    results['cmd'] = ' '.join(cmd)
+    results['cmd'] = cmd
     results['rc'] = rc
     results['stdout'] = stdout
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(results['cmd']))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: {cmd}')
+    module.log(f'rc: {rc}')
+    module.log(f'stdout: {stdout}')
+    module.log(f'stderr: {stderr}')
 
     if rc != 0:
         results['msg'] = 'Failed to remove resource.'
@@ -1597,15 +1779,18 @@ def nim_reset(module, params):
         Exits with fail_json in case of error
     """
 
-    module.log('NIM - reset operation on {0} resource (force: {1})'.format(params['targets'], params['force']))
+    params_targets = params['targets']
+    params_force = params['force']
+    module.log(f'NIM - reset operation on {params_targets} resource (force: {params_force})')
 
     results['targets'] = expand_targets(params['targets'])
     if not results['targets']:
-        results['msg'] = 'No matching target found for targets \'{0}\'.'.format(params['targets'])
+        results['msg'] = f'No matching target found for targets \'{params_targets}\'.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
-    module.debug('NIM - Target list: {0}'.format(results['targets']))
+    res_targets = results['targets']
+    module.debug(f'NIM - Target list: {res_targets}')
 
     # remove from the list the targets that are already in 'ready' state
     targets_to_reset = []
@@ -1618,8 +1803,9 @@ def nim_reset(module, params):
         else:
             targets_discarded.append(target)
 
+    discarded_targets = ','.join(targets_discarded)
     if targets_discarded:
-        msg = 'The following targets are already ready for a NIM operation: {0}'.format(','.join(targets_discarded))
+        msg = f'The following targets are already ready for a NIM operation: {discarded_targets}'
         results['meta']['messages'].append(msg)
         module.log('NIM - ' + msg)
 
@@ -1635,24 +1821,26 @@ def nim_reset(module, params):
     cmd += ['-o', 'reset']
     cmd += targets_to_reset
 
+    cmd = ' '.join(cmd)
     rc, stdout, stderr = module.run_command(cmd)
 
-    results['cmd'] = ' '.join(cmd)
+    results['cmd'] = cmd
     results['rc'] = rc
     results['stdout'] = stdout
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(results['cmd']))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: {cmd}')
+    module.log(f'rc: {rc}')
+    module.log(f'stdout: {stdout}')
+    module.log(f'stderr: {stderr}')
 
+    reset_targets = ','.join(targets_to_reset)
     if rc != 0:
-        results['msg'] = 'Failed to reset current NIM state on {0}.'.format(','.join(targets_to_reset))
+        results['msg'] = f'Failed to reset current NIM state on {reset_targets}.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
-    msg = 'Successfully reset targets: {0}.'.format(','.join(targets_to_reset))
+    msg = f'Successfully reset targets: {reset_targets}.'
     results['meta']['messages'].append(msg)
     module.log('NIM - ' + msg)
 
@@ -1670,15 +1858,17 @@ def nim_reboot(module, params):
         Exits with fail_json in case of error
     """
 
-    module.log('NIM - reboot operation on {0}'.format(params['targets']))
+    params_targets = params['targets']
+    module.log(f'NIM - reboot operation on {params_targets}')
 
     results['targets'] = expand_targets(params['targets'])
     if not results['targets']:
-        results['msg'] = 'No matching target found for targets \'{0}\'.'.format(params['targets'])
+        results['msg'] = f'No matching target found for targets \'{params_targets}\'.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
-    module.debug('NIM - Target list: {0}'.format(results['targets']))
+    res_targets = results['targets']
+    module.debug(f'NIM - Target list: {res_targets}')
 
     if 'master' in results['targets']:
         results['targets'].remove('master')
@@ -1691,20 +1881,22 @@ def nim_reboot(module, params):
     cmd = ['nim', '-o', 'reboot']
     cmd += results['targets']
 
+    cmd = ' '.join(cmd)
     rc, stdout, stderr = module.run_command(cmd)
 
-    results['cmd'] = ' '.join(cmd)
+    results['cmd'] = cmd
     results['rc'] = rc
     results['stdout'] = stdout
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(results['cmd']))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: {cmd}')
+    module.log(f'rc: {rc}')
+    module.log(f'stdout: {stdout}')
+    module.log(f'stderr: {stderr}')
 
+    joined_targets = ','.join(results['targets'])
     if rc != 0:
-        results['msg'] = 'Failed to reboot NIM clients: {0}.'.format(','.join(results['targets']))
+        results['msg'] = f'Failed to reboot NIM clients: {joined_targets}.'
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
 
@@ -1728,25 +1920,28 @@ def nim_show(module, params):
         cmd += ['-t', params['object_type']]
     results['changed'] = False
 
+    cmd = ' '.join(cmd)
     rc, stdout, stderr = module.run_command(cmd)
 
-    results['cmd'] = ' '.join(cmd)
+    results['cmd'] = cmd
     results['rc'] = rc
     results['stdout'] = "see meta.query"
     results['stderr'] = stderr
 
-    module.log('cmd: {0}'.format(' '.join(cmd)))
-    module.log('rc: {0}'.format(rc))
-    module.log('stdout: {0}'.format(stdout))
-    module.log('stderr: {0}'.format(stderr))
+    module.log(f'cmd: {cmd}')
+    module.log(f'rc: {rc}')
+    module.log(f'stdout: {stdout}')
+    module.log(f'stderr: {stderr}')
+
+    params_obj_type = params['object_type']
 
     # check if any info was fetched
     if not stdout and rc == 0:
-        results['meta']['messages'] = "There are no defined NIM objects of type '{0}'".format(params['object_type'])
+        results['meta']['messages'] = f"There are no defined NIM objects of type '{params_obj_type}'"
         return
 
     if rc != 0:
-        results['meta']['messages'] = "Failed to fetch '{0}' NIM objects types".format(params['object_type'])
+        results['meta']['messages'] = f"Failed to fetch '{params_obj_type}' NIM objects types"
         module.log('NIM - Error: ' + results['msg'])
         module.fail_json(**results)
     else:
@@ -1902,12 +2097,13 @@ def main():
                         choices=['update', 'master_setup', 'check', 'compare',
                                  'script', 'allocate', 'deallocate',
                                  'bos_inst', 'define_script', 'remove',
-                                 'reset', 'reboot', 'maintenance', 'show', 'register_client']),
+                                 'reset', 'reboot', 'maintenance', 'show', 'register_client', 'install_fileset']),
             lpp_source=dict(type='str'),
             targets=dict(type='list', elements='str'),
             new_targets=dict(type='list', elements='str'),  # The elements format is <machine name>-<login id>-<password>
             asynchronous=dict(type='bool', default=False),
             device=dict(type='str'),
+            installp_bundle=dict(type='str'),
             script=dict(type='str'),
             resource=dict(type='str'),
             location=dict(type='str'),
@@ -1930,6 +2126,7 @@ def main():
             ['action', 'reset', ['targets']],
             ['action', 'reboot', ['targets']],
             ['action', 'maintenance', ['targets']],
+            ['action', 'install_fileset', ['targets', 'lpp_source', 'installp_bundle']],
             ['action', 'register_client', ['new_targets']]
         ]
     )
@@ -1976,10 +2173,11 @@ def main():
     boot_client = module.params['boot_client']
     object_type = module.params['object_type']
     alt_disk_update_name = module.params['alt_disk_update_name']
+    installp_bundle = module.params['installp_bundle']
 
     params = {}
 
-    module.debug('*** START NIM operation {0} ***'.format(action))
+    module.debug(f'*** START NIM operation {action} ***')
 
     module.run_command_environ_update = dict(LANG='C', LC_ALL='C', LC_MESSAGES='C', LC_CTYPE='C')
 
@@ -2044,6 +2242,12 @@ def main():
         params['location'] = location
         nim_define_script(module, params)
 
+    elif action == 'install_fileset':
+        params['targets'] = targets
+        params['lpp_source'] = lpp_source
+        params['installp_bundle'] = installp_bundle
+        install_filesets(module, params)
+
     elif action == 'remove':
         params['resource'] = resource
         nim_remove(module, params)
@@ -2065,11 +2269,11 @@ def main():
     if results['status']:
         target_errored = [key for key, val in results['status'].items() if 'FAILURE' in val]
         if len(target_errored):
-            results['msg'] = 'NIM {0} operation failed for {1}. See status and meta for details.'.format(action, target_errored)
+            results['msg'] += f' NIM {action} operation failed for {target_errored}. See status and meta for details.'
             module.log(results['msg'])
             module.fail_json(**results)
 
-    results['msg'] = 'NIM {0} operation successful. See status and meta for details.'.format(action)
+    results['msg'] += f' NIM {action} operation successful. See status and meta for details.'
     module.log(results['msg'])
     module.exit_json(**results)
 

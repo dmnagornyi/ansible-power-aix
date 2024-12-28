@@ -12,6 +12,7 @@
 # AIX 6.1 PDF: https://public.dhe.ibm.com/systems/power/docs/aix/61/aixcmds1_pdf.pdf
 
 from __future__ import absolute_import, division, print_function
+from ansible.module_utils.basic import AnsibleModule
 __metaclass__ = type
 
 DOCUMENTATION = r'''
@@ -27,7 +28,7 @@ author:
   - Stephen Ulmer (@stephenulmer)
 requirements:
   - AIX
-  - Python >= 2.7
+  - Python >= 3.6
   - 'Privileged user with authorizations'
 options:
   file:
@@ -152,8 +153,6 @@ attrs:
       type: int
 '''
 
-from ansible.module_utils.basic import AnsibleModule
-
 
 def set_attr_value(module, filename, stanza, attr, target_value):
     # -> dict:
@@ -166,6 +165,11 @@ def set_attr_value(module, filename, stanza, attr, target_value):
         stderr: stderr
     """
     chsec_command = module.get_bin_path('chsec', required=True)
+    if str(target_value) in ["True", "False"]:
+        if str(target_value) == "True":
+            target_value = "true"
+        else:
+            target_value = "false"
     cmd = [
         chsec_command,
         '-f', filename,
@@ -175,6 +179,8 @@ def set_attr_value(module, filename, stanza, attr, target_value):
     rc, stdout, stderr = module.run_command(cmd)
     if rc != 0:
         msg = 'Failed to run chsec command: ' + ' '.join(cmd)
+        if "3004-692" in stderr:
+            msg += f"Invalid value provided - {target_value}"
         module.fail_json(msg=msg, rc=rc, stdout=stdout, stderr=stderr)
     return_dict = {
         'cmd': ' '.join(cmd),
@@ -192,6 +198,8 @@ def get_current_attr_value(module, filename, stanza, attr):
     rc, stdout, stderr = module.run_command(cmd)
     if rc != 0:
         msg = 'Failed to run lssec command: ' + ' '.join(cmd)
+        if "3004-725" in stderr:
+            msg += f" Invalid stanza: '{stanza}'"
         module.fail_json(msg=msg, rc=rc, stdout=stdout, stderr=stderr)
     # Strip newline and double-quotation marks that are sometimes added
     lssec_out = stdout.splitlines()[1].split(':', 1)[1].strip('\\\"\n')
